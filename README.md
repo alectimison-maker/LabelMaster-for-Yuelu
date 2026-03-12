@@ -3,6 +3,10 @@
 面向跃鹿战队数据集的装甲板标注工具。  
 基于 ATLabelMaster 思路实现，保留智能标注流程，并增加队伍定制模式与标签导出格式。
 
+## 界面预览
+
+![LabelMaster for Yuelu 界面预览](assets/screenshots/ui-preview.png)
+
 ## 主要功能
 - 模式一：智能标注（自动找框 + 自动类别）
 - 模式二：同兵种智能拉框（手动指定类别，仅做找框）
@@ -28,10 +32,12 @@ TeamArmorLabeler/
 │   └── main.py                    # 主程序入口
 ├── assets/
 │   ├── icons/                     # 透视绘制用图标
-│   └── models/                    # 检测模型
-│       ├── yolov5.xml
-│       ├── yolov5.bin
-│       └── model-opt.onnx
+│   ├── models/                    # 检测模型
+│   │   ├── yolov5.xml
+│   │   ├── yolov5.bin
+│   │   └── model-opt.onnx
+│   └── screenshots/
+│       └── ui-preview.png         # README 界面预览图
 ├── packaging/
 │   └── build_deb.sh               # Debian 打包脚本
 ├── dist/
@@ -43,7 +49,7 @@ TeamArmorLabeler/
 
 ## 标签格式
 
-标签首位为数字类别 `cls_id`（不是字母类别）。
+标签首位为数字类别 `cls_id`。
 
 - `labels_9/*.txt`
 ```text
