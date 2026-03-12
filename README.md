@@ -20,6 +20,28 @@
   - 13点
   - 9+13同时保存
 
+## 项目结构
+
+```text
+TeamArmorLabeler/
+├── app/
+│   └── main.py                    # 主程序入口
+├── assets/
+│   ├── icons/                     # 透视绘制用图标
+│   └── models/                    # 检测模型
+│       ├── yolov5.xml
+│       ├── yolov5.bin
+│       └── model-opt.onnx
+├── packaging/
+│   └── build_deb.sh               # Debian 打包脚本
+├── dist/
+│   └── labelmaster-for-yuelu_1.0.0_amd64.deb
+├── run_labelmaster_for_yuelu.sh   # 本地启动脚本
+└── README.md
+```
+
+说明：已清理测试输出与历史打包残留，`dist/` 仅保留当前可用的安装包。
+
 ## 标签格式
 
 标签首位为数字类别 `cls_id`（不是字母类别）。

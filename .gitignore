@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+dist/test_empty_save/
+dist/test_save_mode/
