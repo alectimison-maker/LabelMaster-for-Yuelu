@@ -40,7 +40,6 @@ TeamArmorLabeler/
 └── README.md
 ```
 
-说明：已清理测试输出与历史打包残留，`dist/` 仅保留当前可用的安装包。
 
 ## 标签格式
 
