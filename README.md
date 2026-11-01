@@ -1,7 +1,8 @@
 # LabelMaster for Yuelu
 
-面向跃鹿战队数据集的装甲板标注工具。  
-基于 ATLabelMaster 思路实现，保留智能标注流程，并增加队伍定制模式与标签导出格式。
+面向湖南大学跃鹿战队的多模式数据集标注工具，支持装甲板智能标注和能量机关待击打符叶预标注。
+
+当前版本：**1.1.0** · [下载 Linux amd64 安装包](https://github.com/alectimison-maker/LabelMaster-for-Yuelu/releases/latest)
 
 ## 界面预览
 
@@ -26,6 +27,7 @@
   - 9点
   - 13点
   - 9+13同时保存
+- 能量机关标注以 LabelMe JSON 保存至 `labels_rune/`，包含符叶四点、派生中心点和 R 标矩形
 
 ## 项目结构
 
@@ -68,7 +70,7 @@ cls_id x1 y1 x2 y2 x3 y3 x4 y4
 cls_id cx cy w h x1 y1 x2 y2 x3 y3 x4 y4
 ```
 
-所有坐标均为归一化坐标，四点顺序为：
+`labels_9` 和 `labels_13` 坐标均为归一化坐标，四点顺序为：
 `1:左上 2:左下 3:右下 4:右上`
 
 能量机关模式不使用装甲的 9/13 点格式，而是在 `labels_rune/*.json` 写入 LabelMe 兼容标注：每片待击打符叶包含四点多边形、由四点均值计算的符叶中心点，以及 R 标矩形。模型只预测 R 标中心，R 标矩形尺寸按符叶尺度估算，因此建议在工具中人工检查并拖动修正。
@@ -90,17 +92,21 @@ cls_id cx cy w h x1 y1 x2 y2 x3 y3 x4 y4
 - ONNX（回退）：`assets/models/model-opt.onnx`
 - 能量机关：深圳大学 RobotPilots 发布的 5 点 ONNX 模型 `assets/models/energy_rune_5kp.onnx`，仅导出 class 0（未激活/待击打）；模型许可证副本见 `assets/models/RuneDetectionModel-LICENSE`。参见[上游模型说明](https://github.com/SZURPVision/RuneDetectionModel)。
 
+R 标矩形的位置使用模型预测的 R 标中心，矩形尺寸由符叶尺度估算；使用前请在画布中检查并修正。
+
 ## 运行方式
 
 ### 方式1：脚本直接运行
 ```bash
-bash /home/.../TeamArmorLabeler/run_labelmaster_for_yuelu.sh
+bash ./run_labelmaster_for_yuelu.sh
 ```
 
-### 方式2：安装 deb
+### 方式2：安装 Debian/Ubuntu amd64 安装包
 ```bash
-sudo dpkg -i /home/.../TeamArmorLabeler/dist/labelmaster-for-yuelu_1.1.0_amd64.deb
+sudo dpkg -i ./dist/labelmaster-for-yuelu_1.1.0_amd64.deb
 ```
+
+也可从[GitHub Releases](https://github.com/alectimison-maker/LabelMaster-for-Yuelu/releases/latest)下载最新安装包。
 
 安装后可通过应用菜单启动，或终端运行：
 ```bash
@@ -109,10 +115,10 @@ labelmaster-for-yuelu
 
 ## 打包 deb
 ```bash
-bash /home/.../TeamArmorLabeler/packaging/build_deb.sh
+bash ./packaging/build_deb.sh
 ```
 输出文件：
-`/home/.../TeamArmorLabeler/dist/labelmaster-for-yuelu_1.1.0_amd64.deb`
+`./dist/labelmaster-for-yuelu_1.1.0_amd64.deb`
 
 ## 快捷键
 - `Space`：智能标注当前图
