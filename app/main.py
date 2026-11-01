@@ -74,7 +74,7 @@ class Annotation:
     cls: str
     pts: np.ndarray  # shape=(4,2); armor: TL, BL, BR, TR; rune: left, top, right, bottom
     score: float = 0.0
-    r_bbox: Optional[np.ndarray] = None  # shape=(2,2), top-left and bottom-right
+    r_center: Optional[np.ndarray] = None  # fifth rune keypoint
 
 
 def copy_anns(src: List[Annotation]) -> List[Annotation]:
@@ -83,7 +83,7 @@ def copy_anns(src: List[Annotation]) -> List[Annotation]:
             cls=a.cls,
             pts=a.pts.copy(),
             score=float(a.score),
-            r_bbox=None if a.r_bbox is None else a.r_bbox.copy(),
+            r_center=None if a.r_center is None else a.r_center.copy(),
         )
         for a in src
     ]
@@ -429,7 +429,7 @@ class SmartArmorDetector:
 class EnergyRuneDetector:
     """Infer only the inactive rune leaves using the SZURPVision five-point model."""
 
-    def __init__(self, model_path: str, confidence: float = 0.80, point_confidence: float = 0.80):
+    def __init__(self, model_path: str, confidence: float = 0.79, point_confidence: float = 0.80):
         self.model_path = model_path
         self.confidence = confidence
         self.point_confidence = point_confidence
@@ -490,17 +490,8 @@ class EnergyRuneDetector:
                  leaf[np.argmax(leaf[:, 0])], leaf[np.argmax(leaf[:, 1])]],
                 dtype=np.float32,
             )
-            span = max(float(np.ptp(leaf[:, 0])), float(np.ptp(leaf[:, 1])))
             r_center = points[2]
-            box_w, box_h = max(18.0, span * 0.24), max(22.0, span * 0.30)
-            r_bbox = np.array(
-                [[r_center[0] - box_w / 2, r_center[1] - box_h / 2],
-                 [r_center[0] + box_w / 2, r_center[1] + box_h / 2]],
-                dtype=np.float32,
-            )
-            r_bbox[:, 0] = np.clip(r_bbox[:, 0], 0, width - 1)
-            r_bbox[:, 1] = np.clip(r_bbox[:, 1], 0, height - 1)
-            ann = Annotation(cls="待击打符叶", pts=leaf_ordered, score=confidence, r_bbox=r_bbox)
+            ann = Annotation(cls="待击打符叶", pts=leaf_ordered, score=confidence, r_center=r_center.copy())
             quality = confidence * float(np.mean(keypoints[:, 2]))
             center = np.mean(np.vstack((leaf, r_center)), axis=0)
             candidates.append((quality, ann, center))
@@ -782,33 +773,14 @@ class ImageCanvas(QWidget):
             else:
                 self._draw_default_box(p, qpts, is_sel)
 
-            # Rune mode also displays the estimated R marker box and the derived leaf center.
-            if self.energy_mode and ann.r_bbox is not None:
-                rb = ann.r_bbox
-                r1 = self.img_to_screen(QPointF(float(rb[0, 0]), float(rb[0, 1])))
-                r2 = self.img_to_screen(QPointF(float(rb[1, 0]), float(rb[1, 1])))
-                p.setPen(QPen(QColor(255, 30, 30), 2))
-                p.setBrush(Qt.NoBrush)
-                p.drawRect(QRect(r1, r2).normalized())
-                r_center = self.img_to_screen(QPointF(float(np.mean(rb[:, 0])), float(np.mean(rb[:, 1]))))
+            # The rune mode has exactly five editable keypoints: four leaf points and the R center.
+            if self.energy_mode and ann.r_center is not None:
+                r_pt = self.img_to_screen(QPointF(float(ann.r_center[0]), float(ann.r_center[1])))
                 p.setPen(QPen(QColor(255, 255, 255), 3))
-                p.drawText(r_center + QPoint(6, -5), "R")
-                p.setPen(QPen(QColor(255, 40, 40), 1))
-                p.setBrush(QColor(255, 40, 40))
-                p.drawEllipse(r_center, 3, 3)
-                if is_sel:
-                    p.setBrush(QColor(255, 40, 40))
-                    p.setPen(QPen(QColor(255, 255, 255), 1))
-                    p.drawRect(QRect(r1.x() - 4, r1.y() - 4, 8, 8))
-                    p.drawRect(QRect(r2.x() - 4, r2.y() - 4, 8, 8))
-
-                leaf_center = self.img_to_screen(
-                    QPointF(float(np.mean(ann.pts[:, 0])), float(np.mean(ann.pts[:, 1])))
-                )
-                p.setPen(QPen(QColor(255, 255, 255), 2))
-                p.setBrush(QColor(255, 255, 255))
-                p.drawEllipse(leaf_center, 4, 4)
-                p.drawText(leaf_center + QPoint(6, -5), "C")
+                p.drawText(r_pt + QPoint(7, -6), "R")
+                p.setPen(QPen(QColor(0, 180, 255), 2))
+                p.setBrush(QColor(0, 180, 255))
+                p.drawEllipse(r_pt, 5 if is_sel else 4, 5 if is_sel else 4)
 
             # 框编号 + 类别
             score_text = f" {ann.score:.2f}" if self.energy_mode and ann.score > 0 else ""
@@ -831,6 +803,10 @@ class ImageCanvas(QWidget):
                 p.drawText(pt + QPoint(6, -6), point_label)
                 p.setPen(QPen(QColor(255, 255, 255), 1))
                 p.drawText(pt + QPoint(6, -6), point_label)
+
+            if self.energy_mode and ann.r_center is None:
+                p.setPen(QPen(QColor(255, 220, 0), 2))
+                p.drawText(QPoint(x1 + 4, min(self.height() - 8, y2 + 20)), "点击 R 标中心补齐第 5 点")
 
         if self.draw_start is not None and self.draw_end is not None:
             a = self.img_to_screen(self.draw_start)
@@ -860,9 +836,8 @@ class ImageCanvas(QWidget):
         px, py = float(img_pt.x()), float(img_pt.y())
         best, best_d = -1, 1e9
         handles = list(ann.pts)
-        if self.energy_mode and ann.r_bbox is not None:
-            handles.extend(list(ann.r_bbox))
-            handles.append(np.mean(ann.r_bbox, axis=0))
+        if self.energy_mode and ann.r_center is not None:
+            handles.append(ann.r_center)
         for i, (x, y) in enumerate(handles):
             d = (float(x) - px) ** 2 + (float(y) - py) ** 2
             if d < best_d:
@@ -874,10 +849,9 @@ class ImageCanvas(QWidget):
         p = QPointF(float(img_pt.x()), float(img_pt.y()))
         for i in range(len(self.anns) - 1, -1, -1):
             ann = self.anns[i]
-            if self.energy_mode and ann.r_bbox is not None:
-                x1, y1 = ann.r_bbox[0]
-                x2, y2 = ann.r_bbox[1]
-                if min(x1, x2) <= p.x() <= max(x1, x2) and min(y1, y2) <= p.y() <= max(y1, y2):
+            if self.energy_mode and ann.r_center is not None:
+                distance = np.linalg.norm(ann.r_center - np.array([p.x(), p.y()], dtype=np.float32))
+                if distance <= 12.0 / max(self.scale, 1e-6):
                     return i
             poly = QPolygonF([QPointF(float(x), float(y)) for x, y in self.anns[i].pts])
             if poly.containsPoint(p, Qt.OddEvenFill):
@@ -899,6 +873,17 @@ class ImageCanvas(QWidget):
 
         if e.button() != Qt.LeftButton:
             return
+
+        if self.energy_mode and 0 <= self.selected_idx < len(self.anns):
+            selected = self.anns[self.selected_idx]
+            if selected.r_center is None:
+                handle = self._hit_handle(img_pt)
+                hit = self._hit_detection(img_pt)
+                if handle < 0 and hit < 0:
+                    selected.r_center = np.array([img_pt.x(), img_pt.y()], dtype=np.float32)
+                    self.annotationsChanged.emit()
+                    self.update()
+                    return
 
         if self.selected_idx >= 0:
             h = self._hit_handle(img_pt)
@@ -926,21 +911,8 @@ class ImageCanvas(QWidget):
             x = clamp01(img_pt.x() / self.qimg.width()) * (self.qimg.width() - 1)
             y = clamp01(img_pt.y() / self.qimg.height()) * (self.qimg.height() - 1)
             ann = self.anns[self.selected_idx]
-            if self.energy_mode and self.drag_handle_idx >= 4 and ann.r_bbox is not None:
-                if self.drag_handle_idx == 6:
-                    old_center = np.mean(ann.r_bbox, axis=0)
-                    delta = np.array([x, y], dtype=np.float32) - old_center
-                    ann.r_bbox[:] = ann.r_bbox + delta
-                else:
-                    corner_idx = self.drag_handle_idx - 4
-                    ann.r_bbox[corner_idx] = [x, y]
-                    x1 = min(float(ann.r_bbox[0, 0]), float(ann.r_bbox[1, 0]))
-                    y1 = min(float(ann.r_bbox[0, 1]), float(ann.r_bbox[1, 1]))
-                    x2 = max(float(ann.r_bbox[0, 0]), float(ann.r_bbox[1, 0]))
-                    y2 = max(float(ann.r_bbox[0, 1]), float(ann.r_bbox[1, 1]))
-                    ann.r_bbox[:] = [[x1, y1], [x2, y2]]
-                ann.r_bbox[:, 0] = np.clip(ann.r_bbox[:, 0], 0, self.qimg.width() - 1)
-                ann.r_bbox[:, 1] = np.clip(ann.r_bbox[:, 1], 0, self.qimg.height() - 1)
+            if self.energy_mode and self.drag_handle_idx == 4:
+                ann.r_center = np.array([x, y], dtype=np.float32)
             else:
                 ann.pts[self.drag_handle_idx] = [x, y]
             self.update()
@@ -980,19 +952,9 @@ class ImageCanvas(QWidget):
         else:
             pts = np.array([[l, t], [l, b], [r, b], [r, t]], dtype=np.float32)
         pts = clamp_pts_to_img(pts, self.qimg.width(), self.qimg.height())
-        r_bbox = None
-        if self.energy_mode:
-            span = max(float(r - l), float(b - t))
-            r_w, r_h = max(18.0, span * 0.24), max(22.0, span * 0.30)
-            r_bbox = np.array(
-                [[mid_x - r_w / 2, mid_y - r_h / 2], [mid_x + r_w / 2, mid_y + r_h / 2]],
-                dtype=np.float32,
-            )
-            r_bbox[:, 0] = np.clip(r_bbox[:, 0], 0, self.qimg.width() - 1)
-            r_bbox[:, 1] = np.clip(r_bbox[:, 1], 0, self.qimg.height() - 1)
 
         cls = "待击打符叶" if self.energy_mode else self.class_provider()
-        self.anns.append(Annotation(cls=cls, pts=pts, score=0.0, r_bbox=r_bbox))
+        self.anns.append(Annotation(cls=cls, pts=pts, score=0.0))
         self.selected_idx = len(self.anns) - 1
         self.selectionChanged.emit(self.selected_idx)
         self.annotationsChanged.emit()
@@ -1093,7 +1055,6 @@ def write_rune_labels(image_path: str, anns: List[Annotation], save_root: str):
     shapes = []
     for group_id, ann in enumerate(anns, start=1):
         points = [[round(float(x), 2), round(float(y), 2)] for x, y in ann.pts]
-        center = [round(float(x), 2) for x in np.mean(ann.pts, axis=0)]
         description = f"SZURPVision RuneDetectionModel; inactive; confidence={ann.score:.3f}"
         shapes.append(
             {
@@ -1105,25 +1066,14 @@ def write_rune_labels(image_path: str, anns: List[Annotation], save_root: str):
                 "flags": {},
             }
         )
-        shapes.append(
-            {
-                "label": "符叶中心",
-                "points": [center],
-                "group_id": group_id,
-                "description": "由符叶上下左右四点取均值",
-                "shape_type": "point",
-                "flags": {},
-            }
-        )
-        if ann.r_bbox is not None:
-            r_points = [[round(float(x), 2), round(float(y), 2)] for x, y in ann.r_bbox]
+        if ann.r_center is not None:
             shapes.append(
                 {
                     "label": "R标",
-                    "points": r_points,
+                    "points": [[round(float(x), 2) for x in ann.r_center]],
                     "group_id": group_id,
-                    "description": "中心来自模型预测；矩形尺寸按符叶尺度估算，请复核",
-                    "shape_type": "rectangle",
+                    "description": "模型预测的 R 标中心关键点",
+                    "shape_type": "point",
                     "flags": {},
                 }
             )
@@ -1162,21 +1112,21 @@ def read_rune_labels(image_path: str, save_root: str = "") -> List[Annotation]:
         points = shape.get("points", [])
         if shape.get("label") == "待击打符叶" and len(points) == 4:
             groups.setdefault(int(group_id), {})["pts"] = points
+        elif shape.get("label") == "R标" and len(points) == 1:
+            groups.setdefault(int(group_id), {})["r_center"] = points[0]
         elif shape.get("label") == "R标" and len(points) == 2:
-            groups.setdefault(int(group_id), {})["r_bbox"] = points
+            # Read older 1.1.0 drafts by converting their estimated R rectangle to its center.
+            legacy_bbox = np.asarray(points, dtype=np.float32).reshape(2, 2)
+            groups.setdefault(int(group_id), {})["r_center"] = np.mean(legacy_bbox, axis=0).tolist()
 
     anns: List[Annotation] = []
     for group in groups.values():
         if "pts" not in group:
             continue
         pts = np.asarray(group["pts"], dtype=np.float32).reshape(4, 2)
-        raw_r_bbox = group.get("r_bbox")
-        r_bbox = None if raw_r_bbox is None else np.asarray(raw_r_bbox, dtype=np.float32).reshape(2, 2)
-        if r_bbox is not None:
-            x1, y1 = np.min(r_bbox, axis=0)
-            x2, y2 = np.max(r_bbox, axis=0)
-            r_bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
-        anns.append(Annotation(cls="待击打符叶", pts=pts, score=0.0, r_bbox=r_bbox))
+        raw_r_center = group.get("r_center")
+        r_center = None if raw_r_center is None else np.asarray(raw_r_center, dtype=np.float32).reshape(2)
+        anns.append(Annotation(cls="待击打符叶", pts=pts, score=0.0, r_center=r_center))
     return anns
 
 
@@ -1475,6 +1425,11 @@ class MainWindow(QMainWindow):
         path = self._current_path()
         if path:
             self.cache[path] = copy_anns(self.canvas.get_annotations())
+        if self.mode_combo.currentIndex() == 2:
+            if any(a.r_center is None for a in self.canvas.get_annotations()):
+                self.status.setText("已画符叶四点；请点击图像中的 R 标中心，补齐第 5 个关键点")
+            else:
+                self.status.setText("五点标注已更新（需保存）")
         self.refresh_box_selector()
         self.update_current_list_item_text()
 
@@ -1646,6 +1601,9 @@ class MainWindow(QMainWindow):
             return
 
         anns = copy_anns(self.last_detect_backup[path])
+        if self.mode_combo.currentIndex() == 2 and any(a.r_center is None for a in anns):
+            QMessageBox.warning(self, "标注未完成", "回退的标注缺少 R 标中心，请补齐第 5 个关键点后保存。")
+            return
         self.cache[path] = copy_anns(anns)
         self.canvas.set_annotations(copy_anns(anns))
         self.refresh_box_selector()
@@ -1710,6 +1668,9 @@ class MainWindow(QMainWindow):
             return
 
         anns = self.canvas.get_annotations()
+        if self.mode_combo.currentIndex() == 2 and any(a.r_center is None for a in anns):
+            QMessageBox.warning(self, "标注未完成", "请先为每片符叶补齐第 5 个关键点：R 标中心。")
+            return
         self.cache[path] = copy_anns(anns)
         self.update_current_list_item_text()
 
@@ -1723,6 +1684,11 @@ class MainWindow(QMainWindow):
             return
 
         self._stash_current_canvas()
+        if self.mode_combo.currentIndex() == 2 and any(
+            ann.r_center is None for anns in self.cache.values() for ann in anns
+        ):
+            QMessageBox.warning(self, "标注未完成", "请先为所有符叶补齐第 5 个关键点：R 标中心。")
+            return
 
         total = 0
         for path in self.image_paths:

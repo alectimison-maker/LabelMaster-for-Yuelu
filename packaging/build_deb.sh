@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="1.1.0"
+VERSION="1.1.1"
 ARCH="amd64"
 PKG_NAME="labelmaster-for-yuelu"
 OUT_DIR="$ROOT_DIR/dist"
