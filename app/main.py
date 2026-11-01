@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import math
 import os
 import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-# Avoid cv2-embedded Qt plugin path conflicts on some systems.
-os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", "/usr/lib/x86_64-linux-gnu/qt5/plugins")
-os.environ.setdefault("QT_PLUGIN_PATH", "/usr/lib/x86_64-linux-gnu/qt5/plugins")
+# Avoid cv2-embedded Qt plugin path conflicts on Debian-based systems.
+SYSTEM_QT_PLUGIN_PATH = "/usr/lib/x86_64-linux-gnu/qt5/plugins"
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", SYSTEM_QT_PLUGIN_PATH)
+    os.environ.setdefault("QT_PLUGIN_PATH", SYSTEM_QT_PLUGIN_PATH)
 
 from PyQt5.QtCore import QPoint, QPointF, QRect, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QPolygonF, QTransform
@@ -32,9 +35,10 @@ from PyQt5.QtSvg import QSvgRenderer
 import cv2
 import numpy as np
 
-# cv2 may override Qt plugin path to its bundled directory; force system Qt plugins back.
-os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = "/usr/lib/x86_64-linux-gnu/qt5/plugins"
-os.environ["QT_PLUGIN_PATH"] = "/usr/lib/x86_64-linux-gnu/qt5/plugins"
+# cv2 may override Qt plugin path to its bundled directory; restore the system path on Linux.
+if sys.platform.startswith("linux"):
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = SYSTEM_QT_PLUGIN_PATH
+    os.environ["QT_PLUGIN_PATH"] = SYSTEM_QT_PLUGIN_PATH
 
 try:
     from openvino import Core, Type, Layout, Tensor
@@ -68,12 +72,21 @@ ID_TO_CLASS = {i: c for i, c in enumerate(CLASS_NAMES)}
 @dataclass
 class Annotation:
     cls: str
-    pts: np.ndarray  # shape=(4,2), order: TL, BL, BR, TR
+    pts: np.ndarray  # shape=(4,2); armor: TL, BL, BR, TR; rune: left, top, right, bottom
     score: float = 0.0
+    r_bbox: Optional[np.ndarray] = None  # shape=(2,2), top-left and bottom-right
 
 
 def copy_anns(src: List[Annotation]) -> List[Annotation]:
-    return [Annotation(cls=a.cls, pts=a.pts.copy(), score=float(a.score)) for a in src]
+    return [
+        Annotation(
+            cls=a.cls,
+            pts=a.pts.copy(),
+            score=float(a.score),
+            r_bbox=None if a.r_bbox is None else a.r_bbox.copy(),
+        )
+        for a in src
+    ]
 
 
 def sigmoid(x: float) -> float:
@@ -322,6 +335,7 @@ class SmartArmorDetector:
         out = [cands[i] for i in keep]
         return out
 
+
     def _detect_openvino_single(
         self, img: np.ndarray, rot_mode: int, orig_w: int, orig_h: int, forced_cls: Optional[str]
     ) -> List[Annotation]:
@@ -412,6 +426,92 @@ class SmartArmorDetector:
         return out
 
 
+class EnergyRuneDetector:
+    """Infer only the inactive rune leaves using the SZURPVision five-point model."""
+
+    def __init__(self, model_path: str, confidence: float = 0.80, point_confidence: float = 0.80):
+        self.model_path = model_path
+        self.confidence = confidence
+        self.point_confidence = point_confidence
+        self.input_w = 640
+        self.input_h = 480
+        self.net = None
+        self.engine_info = "未加载"
+        if model_path and os.path.isfile(model_path):
+            try:
+                self.net = cv2.dnn.readNetFromONNX(model_path)
+                self.engine_info = "SZURPVision ONNX / OpenCV DNN"
+            except Exception as exc:
+                self.engine_info = f"模型加载失败: {exc}"
+        else:
+            self.engine_info = "模型文件不存在"
+
+    def detect(self, bgr: np.ndarray) -> List[Annotation]:
+        if self.net is None or bgr is None or bgr.size == 0:
+            return []
+
+        height, width = bgr.shape[:2]
+        scale = min(self.input_w / width, self.input_h / height)
+        resized_w = max(1, int(round(width * scale)))
+        resized_h = max(1, int(round(height * scale)))
+        pad_left = (self.input_w - resized_w) // 2
+        pad_top = (self.input_h - resized_h) // 2
+        resized = cv2.resize(bgr, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+        canvas = np.full((self.input_h, self.input_w, 3), 114, dtype=np.uint8)
+        canvas[pad_top : pad_top + resized_h, pad_left : pad_left + resized_w] = resized
+        blob = cv2.dnn.blobFromImage(
+            canvas, scalefactor=1.0 / 255.0, size=(self.input_w, self.input_h), swapRB=True, crop=False
+        )
+        self.net.setInput(blob)
+        raw = self.net.forward()
+        rows = raw[0].T if raw.ndim == 3 and raw.shape[1] < raw.shape[2] else raw[0]
+
+        candidates: List[Tuple[float, Annotation, np.ndarray]] = []
+        for row in rows:
+            if row.size < 18 or not np.all(np.isfinite(row[:18])):
+                continue
+            class_id = int(np.argmax(row[:3]))
+            confidence = float(row[class_id])
+            # Class 0 is inactive / pre-strike. Activated blades are intentionally ignored.
+            if class_id != 0 or confidence < self.confidence:
+                continue
+
+            keypoints = row[3:18].reshape(5, 3)
+            if np.any(keypoints[:, 2] < self.point_confidence) or np.any(keypoints[:, :2] < 0):
+                continue
+            points = np.empty((5, 2), dtype=np.float32)
+            points[:, 0] = np.clip((keypoints[:, 0] - pad_left) / scale, 0, width - 1)
+            points[:, 1] = np.clip((keypoints[:, 1] - pad_top) / scale, 0, height - 1)
+
+            # Model order: two leaf corners, R center, two leaf corners.
+            leaf = points[[0, 1, 3, 4]]
+            leaf_ordered = np.array(
+                [leaf[np.argmin(leaf[:, 0])], leaf[np.argmin(leaf[:, 1])],
+                 leaf[np.argmax(leaf[:, 0])], leaf[np.argmax(leaf[:, 1])]],
+                dtype=np.float32,
+            )
+            span = max(float(np.ptp(leaf[:, 0])), float(np.ptp(leaf[:, 1])))
+            r_center = points[2]
+            box_w, box_h = max(18.0, span * 0.24), max(22.0, span * 0.30)
+            r_bbox = np.array(
+                [[r_center[0] - box_w / 2, r_center[1] - box_h / 2],
+                 [r_center[0] + box_w / 2, r_center[1] + box_h / 2]],
+                dtype=np.float32,
+            )
+            r_bbox[:, 0] = np.clip(r_bbox[:, 0], 0, width - 1)
+            r_bbox[:, 1] = np.clip(r_bbox[:, 1], 0, height - 1)
+            ann = Annotation(cls="待击打符叶", pts=leaf_ordered, score=confidence, r_bbox=r_bbox)
+            quality = confidence * float(np.mean(keypoints[:, 2]))
+            center = np.mean(np.vstack((leaf, r_center)), axis=0)
+            candidates.append((quality, ann, center))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        kept: List[Tuple[float, Annotation, np.ndarray]] = []
+        for candidate in candidates:
+            if all(float(np.linalg.norm(candidate[2] - item[2])) >= 30.0 for item in kept):
+                kept.append(candidate)
+        return [item[1] for item in kept]
+
 class ImageCanvas(QWidget):
     selectionChanged = pyqtSignal(int)
     annotationsChanged = pyqtSignal()
@@ -448,6 +548,7 @@ class ImageCanvas(QWidget):
         self.draw_start: Optional[QPointF] = None
         self.draw_end: Optional[QPointF] = None
         self.box_style = self.STYLE_DEFAULT
+        self.energy_mode = False
 
         self.icons_dir = icons_dir
         self.svg_renderers: Dict[str, QSvgRenderer] = {}
@@ -477,6 +578,10 @@ class ImageCanvas(QWidget):
 
     def set_box_style(self, style_idx: int):
         self.box_style = self.STYLE_ICON_PERSPECTIVE if style_idx == self.STYLE_ICON_PERSPECTIVE else self.STYLE_DEFAULT
+        self.update()
+
+    def set_energy_mode(self, enabled: bool):
+        self.energy_mode = bool(enabled)
         self.update()
 
     def _infer_big_by_shape(self, pts: np.ndarray) -> bool:
@@ -531,6 +636,7 @@ class ImageCanvas(QWidget):
         x2 = max(pt.x() for pt in qpts)
         y2 = max(pt.y() for pt in qpts)
         p.setPen(QPen(QColor(255, 220, 0), 2) if is_sel else QPen(QColor(0, 255, 0), 2))
+        p.setBrush(Qt.NoBrush)
         p.drawRect(QRect(QPoint(x1, y1), QPoint(x2, y2)))
         p.setPen(QPen(QColor(0, 200, 255), 1))
         for i in range(4):
@@ -676,24 +782,55 @@ class ImageCanvas(QWidget):
             else:
                 self._draw_default_box(p, qpts, is_sel)
 
+            # Rune mode also displays the estimated R marker box and the derived leaf center.
+            if self.energy_mode and ann.r_bbox is not None:
+                rb = ann.r_bbox
+                r1 = self.img_to_screen(QPointF(float(rb[0, 0]), float(rb[0, 1])))
+                r2 = self.img_to_screen(QPointF(float(rb[1, 0]), float(rb[1, 1])))
+                p.setPen(QPen(QColor(255, 30, 30), 2))
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(QRect(r1, r2).normalized())
+                r_center = self.img_to_screen(QPointF(float(np.mean(rb[:, 0])), float(np.mean(rb[:, 1]))))
+                p.setPen(QPen(QColor(255, 255, 255), 3))
+                p.drawText(r_center + QPoint(6, -5), "R")
+                p.setPen(QPen(QColor(255, 40, 40), 1))
+                p.setBrush(QColor(255, 40, 40))
+                p.drawEllipse(r_center, 3, 3)
+                if is_sel:
+                    p.setBrush(QColor(255, 40, 40))
+                    p.setPen(QPen(QColor(255, 255, 255), 1))
+                    p.drawRect(QRect(r1.x() - 4, r1.y() - 4, 8, 8))
+                    p.drawRect(QRect(r2.x() - 4, r2.y() - 4, 8, 8))
+
+                leaf_center = self.img_to_screen(
+                    QPointF(float(np.mean(ann.pts[:, 0])), float(np.mean(ann.pts[:, 1])))
+                )
+                p.setPen(QPen(QColor(255, 255, 255), 2))
+                p.setBrush(QColor(255, 255, 255))
+                p.drawEllipse(leaf_center, 4, 4)
+                p.drawText(leaf_center + QPoint(6, -5), "C")
+
             # 框编号 + 类别
-            id_text = f"#{idx + 1} {ann.cls}"
+            score_text = f" {ann.score:.2f}" if self.energy_mode and ann.score > 0 else ""
+            id_text = f"#{idx + 1} {ann.cls}{score_text}"
             text_pos = QPoint(x1 + 4, max(14, y1 - 4))
             p.setPen(QPen(QColor(0, 0, 0), 3))
             p.drawText(text_pos, id_text)
             p.setPen(QPen(QColor(0, 255, 0), 1))
             p.drawText(text_pos, id_text)
 
-            # 角点和点号
+            # 角点名称
+            rune_point_names = ["左", "上", "右", "下"]
             for i, pt in enumerate(qpts):
                 p.setPen(QPen(QColor(255, 0, 0), 2))
                 p.setBrush(QColor(255, 0, 0))
                 radius = 5 if is_sel else 4
                 p.drawEllipse(pt, radius, radius)
                 p.setPen(QPen(QColor(0, 0, 0), 3))
-                p.drawText(pt + QPoint(6, -6), str(i + 1))
+                point_label = rune_point_names[i] if self.energy_mode else str(i + 1)
+                p.drawText(pt + QPoint(6, -6), point_label)
                 p.setPen(QPen(QColor(255, 255, 255), 1))
-                p.drawText(pt + QPoint(6, -6), str(i + 1))
+                p.drawText(pt + QPoint(6, -6), point_label)
 
         if self.draw_start is not None and self.draw_end is not None:
             a = self.img_to_screen(self.draw_start)
@@ -722,7 +859,11 @@ class ImageCanvas(QWidget):
         ann = self.anns[self.selected_idx]
         px, py = float(img_pt.x()), float(img_pt.y())
         best, best_d = -1, 1e9
-        for i, (x, y) in enumerate(ann.pts):
+        handles = list(ann.pts)
+        if self.energy_mode and ann.r_bbox is not None:
+            handles.extend(list(ann.r_bbox))
+            handles.append(np.mean(ann.r_bbox, axis=0))
+        for i, (x, y) in enumerate(handles):
             d = (float(x) - px) ** 2 + (float(y) - py) ** 2
             if d < best_d:
                 best, best_d = i, d
@@ -732,6 +873,12 @@ class ImageCanvas(QWidget):
     def _hit_detection(self, img_pt: QPointF) -> int:
         p = QPointF(float(img_pt.x()), float(img_pt.y()))
         for i in range(len(self.anns) - 1, -1, -1):
+            ann = self.anns[i]
+            if self.energy_mode and ann.r_bbox is not None:
+                x1, y1 = ann.r_bbox[0]
+                x2, y2 = ann.r_bbox[1]
+                if min(x1, x2) <= p.x() <= max(x1, x2) and min(y1, y2) <= p.y() <= max(y1, y2):
+                    return i
             poly = QPolygonF([QPointF(float(x), float(y)) for x, y in self.anns[i].pts])
             if poly.containsPoint(p, Qt.OddEvenFill):
                 return i
@@ -778,7 +925,24 @@ class ImageCanvas(QWidget):
         if self.drag_handle_idx >= 0 and 0 <= self.selected_idx < len(self.anns):
             x = clamp01(img_pt.x() / self.qimg.width()) * (self.qimg.width() - 1)
             y = clamp01(img_pt.y() / self.qimg.height()) * (self.qimg.height() - 1)
-            self.anns[self.selected_idx].pts[self.drag_handle_idx] = [x, y]
+            ann = self.anns[self.selected_idx]
+            if self.energy_mode and self.drag_handle_idx >= 4 and ann.r_bbox is not None:
+                if self.drag_handle_idx == 6:
+                    old_center = np.mean(ann.r_bbox, axis=0)
+                    delta = np.array([x, y], dtype=np.float32) - old_center
+                    ann.r_bbox[:] = ann.r_bbox + delta
+                else:
+                    corner_idx = self.drag_handle_idx - 4
+                    ann.r_bbox[corner_idx] = [x, y]
+                    x1 = min(float(ann.r_bbox[0, 0]), float(ann.r_bbox[1, 0]))
+                    y1 = min(float(ann.r_bbox[0, 1]), float(ann.r_bbox[1, 1]))
+                    x2 = max(float(ann.r_bbox[0, 0]), float(ann.r_bbox[1, 0]))
+                    y2 = max(float(ann.r_bbox[0, 1]), float(ann.r_bbox[1, 1]))
+                    ann.r_bbox[:] = [[x1, y1], [x2, y2]]
+                ann.r_bbox[:, 0] = np.clip(ann.r_bbox[:, 0], 0, self.qimg.width() - 1)
+                ann.r_bbox[:, 1] = np.clip(ann.r_bbox[:, 1], 0, self.qimg.height() - 1)
+            else:
+                ann.pts[self.drag_handle_idx] = [x, y]
             self.update()
             return
 
@@ -810,10 +974,25 @@ class ImageCanvas(QWidget):
 
         l, r = min(x1, x2), max(x1, x2)
         t, b = min(y1, y2), max(y1, y2)
-        pts = np.array([[l, t], [l, b], [r, b], [r, t]], dtype=np.float32)
+        if self.energy_mode:
+            mid_x, mid_y = (l + r) / 2.0, (t + b) / 2.0
+            pts = np.array([[l, mid_y], [mid_x, t], [r, mid_y], [mid_x, b]], dtype=np.float32)
+        else:
+            pts = np.array([[l, t], [l, b], [r, b], [r, t]], dtype=np.float32)
         pts = clamp_pts_to_img(pts, self.qimg.width(), self.qimg.height())
+        r_bbox = None
+        if self.energy_mode:
+            span = max(float(r - l), float(b - t))
+            r_w, r_h = max(18.0, span * 0.24), max(22.0, span * 0.30)
+            r_bbox = np.array(
+                [[mid_x - r_w / 2, mid_y - r_h / 2], [mid_x + r_w / 2, mid_y + r_h / 2]],
+                dtype=np.float32,
+            )
+            r_bbox[:, 0] = np.clip(r_bbox[:, 0], 0, self.qimg.width() - 1)
+            r_bbox[:, 1] = np.clip(r_bbox[:, 1], 0, self.qimg.height() - 1)
 
-        self.anns.append(Annotation(cls=self.class_provider(), pts=pts, score=0.0))
+        cls = "待击打符叶" if self.energy_mode else self.class_provider()
+        self.anns.append(Annotation(cls=cls, pts=pts, score=0.0, r_bbox=r_bbox))
         self.selected_idx = len(self.anns) - 1
         self.selectionChanged.emit(self.selected_idx)
         self.annotationsChanged.emit()
@@ -839,6 +1018,10 @@ def safe_remove(path: str):
 
 
 def write_labels(image_path: str, anns: List[Annotation], save_root: str, save_mode: str):
+    if save_mode == "rune":
+        write_rune_labels(image_path, anns, save_root)
+        return
+
     # save_mode: both | 9 | 13
     img = cv2.imread(image_path)
     if img is None:
@@ -898,14 +1081,116 @@ def write_labels(image_path: str, anns: List[Annotation], save_root: str, save_m
             file13.close()
 
 
-def read_labels_if_any(image_path: str) -> List[Annotation]:
+def write_rune_labels(image_path: str, anns: List[Annotation], save_root: str):
+    img = cv2.imread(image_path)
+    if img is None:
+        return
+    height, width = img.shape[:2]
+    out_dir = os.path.join(save_root, "labels_rune")
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, os.path.splitext(os.path.basename(image_path))[0] + ".json")
+
+    shapes = []
+    for group_id, ann in enumerate(anns, start=1):
+        points = [[round(float(x), 2), round(float(y), 2)] for x, y in ann.pts]
+        center = [round(float(x), 2) for x in np.mean(ann.pts, axis=0)]
+        description = f"SZURPVision RuneDetectionModel; inactive; confidence={ann.score:.3f}"
+        shapes.append(
+            {
+                "label": "待击打符叶",
+                "points": points,
+                "group_id": group_id,
+                "description": description,
+                "shape_type": "polygon",
+                "flags": {},
+            }
+        )
+        shapes.append(
+            {
+                "label": "符叶中心",
+                "points": [center],
+                "group_id": group_id,
+                "description": "由符叶上下左右四点取均值",
+                "shape_type": "point",
+                "flags": {},
+            }
+        )
+        if ann.r_bbox is not None:
+            r_points = [[round(float(x), 2), round(float(y), 2)] for x, y in ann.r_bbox]
+            shapes.append(
+                {
+                    "label": "R标",
+                    "points": r_points,
+                    "group_id": group_id,
+                    "description": "中心来自模型预测；矩形尺寸按符叶尺度估算，请复核",
+                    "shape_type": "rectangle",
+                    "flags": {},
+                }
+            )
+
+    relative_image = os.path.relpath(os.path.abspath(image_path), os.path.abspath(out_dir))
+    data = {
+        "version": "5.0.1",
+        "flags": {},
+        "shapes": shapes,
+        "imagePath": relative_image,
+        "imageData": None,
+        "imageHeight": height,
+        "imageWidth": width,
+    }
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def read_rune_labels(image_path: str, save_root: str = "") -> List[Annotation]:
+    base = os.path.splitext(os.path.basename(image_path))[0] + ".json"
+    label_root = save_root or os.path.dirname(image_path)
+    label_path = os.path.join(label_root, "labels_rune", base)
+    if not os.path.isfile(label_path):
+        return []
+    try:
+        with open(label_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    groups: Dict[int, Dict[str, object]] = {}
+    for shape in data.get("shapes", []):
+        group_id = shape.get("group_id")
+        if group_id is None:
+            continue
+        points = shape.get("points", [])
+        if shape.get("label") == "待击打符叶" and len(points) == 4:
+            groups.setdefault(int(group_id), {})["pts"] = points
+        elif shape.get("label") == "R标" and len(points) == 2:
+            groups.setdefault(int(group_id), {})["r_bbox"] = points
+
+    anns: List[Annotation] = []
+    for group in groups.values():
+        if "pts" not in group:
+            continue
+        pts = np.asarray(group["pts"], dtype=np.float32).reshape(4, 2)
+        raw_r_bbox = group.get("r_bbox")
+        r_bbox = None if raw_r_bbox is None else np.asarray(raw_r_bbox, dtype=np.float32).reshape(2, 2)
+        if r_bbox is not None:
+            x1, y1 = np.min(r_bbox, axis=0)
+            x2, y2 = np.max(r_bbox, axis=0)
+            r_bbox = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
+        anns.append(Annotation(cls="待击打符叶", pts=pts, score=0.0, r_bbox=r_bbox))
+    return anns
+
+
+def read_labels_if_any(image_path: str, energy: bool = False, save_root: str = "") -> List[Annotation]:
+    if energy:
+        return read_rune_labels(image_path, save_root=save_root)
+
     img = cv2.imread(image_path)
     if img is None:
         return []
     h, w = img.shape[:2]
 
     base = os.path.splitext(os.path.basename(image_path))[0] + ".txt"
-    root = os.path.dirname(image_path)
+    root = save_root or os.path.dirname(image_path)
     p13 = os.path.join(root, "labels_13", base)
     p9 = os.path.join(root, "labels_9", base)
 
@@ -934,16 +1219,18 @@ def read_labels_if_any(image_path: str) -> List[Annotation]:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, ov_xml_path: str, onnx_path: str):
+    def __init__(self, ov_xml_path: str, onnx_path: str, energy_model_path: str = ""):
         super().__init__()
         self.setWindowTitle("LabelMaster for Yuelu")
         self.resize(1600, 940)
 
         self.detector = SmartArmorDetector(ov_xml_path=ov_xml_path, onnx_path=onnx_path)
+        self.energy_detector = EnergyRuneDetector(model_path=energy_model_path)
         self.image_dir = ""
         self.image_paths: List[str] = []
         self.current_idx = -1
-        self.cache: Dict[str, List[Annotation]] = {}
+        self.mode_caches: Dict[str, Dict[str, List[Annotation]]] = {"armor": {}, "rune": {}}
+        self.cache: Dict[str, List[Annotation]] = self.mode_caches["armor"]
         self.cv_current: Optional[np.ndarray] = None
         self.save_root = ""
         self.last_detect_backup: Dict[str, List[Annotation]] = {}
@@ -955,7 +1242,7 @@ class MainWindow(QMainWindow):
         self.btn_next = QPushButton("下一张 (E)")
 
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["模式一：智能标注", "模式二：同兵种智能拉框"])
+        self.mode_combo.addItems(["模式一：智能标注", "模式二：同兵种智能拉框", "模式三：能量机关（待击打）"])
         self.class_combo = QComboBox()
         self.class_combo.addItems(CLASS_NAMES)
 
@@ -1051,7 +1338,7 @@ class MainWindow(QMainWindow):
         self.on_style_changed()
 
         self.status.setText(
-            f"检测引擎: {self.detector.engine_info} | 旋转增强: {'开' if self.detector.use_rot_aug else '关'}"
+            f"装甲检测: {self.detector.engine_info} | 能量机关: {self.energy_detector.engine_info}"
         )
 
     def keyPressEvent(self, e):
@@ -1078,6 +1365,8 @@ class MainWindow(QMainWindow):
         return self.class_combo.currentText()
 
     def get_save_mode(self) -> str:
+        if self.mode_combo.currentIndex() == 2:
+            return "rune"
         idx = self.save_mode_combo.currentIndex()
         if idx == 1:
             return "9"
@@ -1212,8 +1501,25 @@ class MainWindow(QMainWindow):
         self.lbl_save_root.setText(f"保存路径: {d}")
 
     def on_mode_changed(self):
+        path = self._current_path()
+        if path:
+            self._stash_current_canvas()
         is_mode2 = self.mode_combo.currentIndex() == 1
+        is_energy = self.mode_combo.currentIndex() == 2
         self.class_combo.setEnabled(is_mode2)
+        self.save_mode_combo.setEnabled(not is_energy)
+        self.style_combo.setEnabled(not is_energy)
+        if is_energy and self.style_combo.currentIndex() != ImageCanvas.STYLE_DEFAULT:
+            self.style_combo.blockSignals(True)
+            self.style_combo.setCurrentIndex(ImageCanvas.STYLE_DEFAULT)
+            self.style_combo.blockSignals(False)
+            self.canvas.set_box_style(ImageCanvas.STYLE_DEFAULT)
+        self.canvas.set_energy_mode(is_energy)
+        self.cache = self.mode_caches["rune" if is_energy else "armor"]
+        self.last_detect_backup.clear()
+        if path:
+            self.load_current()
+            self.refresh_image_list(keep_path=path)
 
     def on_style_changed(self):
         idx = self.style_combo.currentIndex()
@@ -1246,10 +1552,12 @@ class MainWindow(QMainWindow):
         self.image_dir = d
         self.image_paths = files
         self.current_idx = 0
-        self.cache.clear()
+        self.mode_caches = {"armor": {}, "rune": {}}
+        self.cache = self.mode_caches["rune" if self.mode_combo.currentIndex() == 2 else "armor"]
         self.last_detect_backup.clear()
         for p in self.image_paths:
-            self.cache[p] = read_labels_if_any(p)
+            self.mode_caches["armor"][p] = read_labels_if_any(p, save_root=self.save_root)
+            self.mode_caches["rune"][p] = read_labels_if_any(p, energy=True, save_root=self.save_root)
         self.refresh_image_list(keep_path=self.image_paths[0])
 
     def on_select_idx(self, idx: int):
@@ -1276,7 +1584,9 @@ class MainWindow(QMainWindow):
 
         anns = self.cache.get(path)
         if anns is None:
-            anns = read_labels_if_any(path)
+            anns = read_labels_if_any(
+                path, energy=self.mode_combo.currentIndex() == 2, save_root=self.save_root
+            )
             self.cache[path] = copy_anns(anns)
         self.canvas.set_annotations(copy_anns(anns))
         self.refresh_box_selector()
@@ -1308,10 +1618,13 @@ class MainWindow(QMainWindow):
         before = self.cache.get(path, [])
         self.last_detect_backup[path] = copy_anns(before)
 
-        if self.mode_combo.currentIndex() == 0:
+        mode = self.mode_combo.currentIndex()
+        if mode == 0:
             anns = self.detector.detect_mode1(self.cv_current)
-        else:
+        elif mode == 1:
             anns = self.detector.detect_boxes_only(self.cv_current, self.get_selected_class())
+        else:
+            anns = self.energy_detector.detect(self.cv_current)
 
         self.cache[path] = copy_anns(anns)
         self.canvas.set_annotations(copy_anns(anns))
@@ -1372,7 +1685,12 @@ class MainWindow(QMainWindow):
             prev = self.cache.get(path, [])
             self.last_detect_backup[path] = copy_anns(prev)
 
-            anns = self.detector.detect_mode1(img) if mode == 0 else self.detector.detect_boxes_only(img, forced)
+            if mode == 0:
+                anns = self.detector.detect_mode1(img)
+            elif mode == 1:
+                anns = self.detector.detect_boxes_only(img, forced)
+            else:
+                anns = self.energy_detector.detect(img)
             self.cache[path] = copy_anns(anns)
 
             count_obj += len(anns)
@@ -1413,7 +1731,9 @@ class MainWindow(QMainWindow):
             write_labels(path, anns, save_root, self.get_save_mode())
             total += len(anns)
 
-        out_dir_show = self.save_root if self.save_root else "图片目录(labels_9/labels_13)"
+        out_dir_show = self.save_root if self.save_root else (
+            "图片目录/labels_rune" if self.mode_combo.currentIndex() == 2 else "图片目录(labels_9/labels_13)"
+        )
         self.status.setText(f"全部保存完成，总目标数: {total} | 输出目录: {out_dir_show}")
 
 
@@ -1421,6 +1741,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ov-xml", default="", help="yolov5.xml 路径（OpenVINO）")
     parser.add_argument("--model", default="", help="model-opt.onnx 路径（补充引擎）")
+    parser.add_argument("--energy-model", default="", help="能量机关 5 点模型 ONNX 路径")
     args = parser.parse_args()
 
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1430,11 +1751,13 @@ if __name__ == "__main__":
         default_ov = alt if os.path.isfile(alt) else ""
 
     default_onnx = os.path.join(base_dir, "assets", "models", "model-opt.onnx")
+    default_energy_model = os.path.join(base_dir, "assets", "models", "energy_rune_5kp.onnx")
 
     ov_xml_path = args.ov_xml or default_ov
     onnx_path = args.model or default_onnx
+    energy_model_path = args.energy_model or default_energy_model
 
     app = QApplication(sys.argv)
-    w = MainWindow(ov_xml_path=ov_xml_path, onnx_path=onnx_path)
+    w = MainWindow(ov_xml_path=ov_xml_path, onnx_path=onnx_path, energy_model_path=energy_model_path)
     w.show()
     sys.exit(app.exec_())
